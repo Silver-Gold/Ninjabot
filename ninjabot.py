@@ -50,7 +50,7 @@ MAX_MISSED_FRAMES = 5         # delete track if not seen for this many frames
 
 # ---- Direction classification (scale-invariant) ----
 # dy_norm = dy / frame_height (negative = up)
-DY_UP_THRESH_NORM = 0.01      # mean(dy_norm) must be < -DY_UP_THRESH_NORM to be "upward"
+DY_UP_THRESH_NORM = 0.008      # mean(dy_norm) must be < -DY_UP_THRESH_NORM to be "upward"
 # dx_norm = dx / frame_width
 DX_MAX_FRUIT_NORM = 0.02      # fruits: average |dx|/frame_width must be below this (slices can be more horizontal)
 
@@ -65,486 +65,427 @@ SWIPE_STEPS_PER_SEG = 4         # interpolation steps per segment between fruits
 
 SWIPE_COOLDOWN_FRAMES = 2   # minimum frames between swipes (tune this)
 
+
 # Global exit flag controlled by ESC
 exit_requested = False
 
-
-# ---------
-# TRACKING
-# ---------
+# -------------------------
+# TRACKING DATA STRUCTURES
+# -------------------------
 
 @dataclass
 class Track:
     track_id: int
     positions: List[Tuple[float, float]] = field(default_factory=list)
-    bbox: Tuple[int, int, int, int] = (0, 0, 0, 0)  # x, y, w, h
+    bbox: Tuple[int, int, int, int] = (0,0,0,0)
     last_seen_frame: int = 0
-    has_swiped: bool = False  # ensure we only trigger one swipe per track
 
-    def add_detection(self, cx: float, cy: float, bbox: Tuple[int, int, int, int], frame_index: int):
+    def add_detection(self, cx, cy, bbox, frame_idx):
         self.positions.append((cx, cy))
         if len(self.positions) > MAX_HISTORY_LEN:
             self.positions.pop(0)
         self.bbox = bbox
-        self.last_seen_frame = frame_index
+        self.last_seen_frame = frame_idx
 
-    def is_upward_fruit(
-        self,
-        frame_w: int,
-        frame_h: int,
-    ) -> bool:
-        """Decide if this track looks like an upward-moving fruit."""
+    def is_upward_fruit(self, frame_w, frame_h):
+        """Classify as upward-moving fruit."""
         if len(self.positions) < MIN_HISTORY_FOR_CLASS:
             return False
 
-        # Use the last K steps (up to MIN_HISTORY_FOR_CLASS)
         k = min(MIN_HISTORY_FOR_CLASS, len(self.positions) - 1)
-        recent = self.positions[-(k + 1):]  # k+1 points -> k steps
+        pts = self.positions[-(k+1):]
 
         dys = []
         dxs = []
-        for (x_prev, y_prev), (x_curr, y_curr) in zip(recent[:-1], recent[1:]):
-            dxs.append(x_curr - x_prev)
-            dys.append(y_curr - y_prev)
+        for (x1,y1),(x2,y2) in zip(pts[:-1], pts[1:]):
+            dxs.append(x2 - x1)
+            dys.append(y2 - y1)
 
         if not dys:
             return False
 
-        # Normalize by frame dimensions
         dy_norm = np.array(dys) / float(frame_h)
         dx_norm = np.array(dxs) / float(frame_w)
 
-        mean_dy_norm = float(np.mean(dy_norm))
-        mean_abs_dx_norm = float(np.mean(np.abs(dx_norm)))
+        mean_dy = float(np.mean(dy_norm))
+        mean_dx = float(np.mean(np.abs(dx_norm)))
 
-        # Centroid position (current)
         cx, cy = self.positions[-1]
 
-        # Only consider objects in bottom region (where fruits are launched)
+        # bottom window constraint
         if not (BOTTOM_REGION_MIN_RATIO * frame_h <= cy <= BOTTOM_REGION_MAX_RATIO * frame_h):
             return False
 
-        # Require net upward motion (negative dy, big enough in magnitude)
-        if mean_dy_norm >= -DY_UP_THRESH_NORM:
+        # upward motion
+        if mean_dy >= -DY_UP_THRESH_NORM:
             return False
 
-        # Require mostly vertical motion (low horizontal component)
-        if mean_abs_dx_norm > DX_MAX_FRUIT_NORM:
+        # mostly vertical
+        if mean_dx > DX_MAX_FRUIT_NORM:
             return False
 
-        # Also reject if the latest step is clearly downward (changing direction)
-        latest_dy_norm = dy_norm[-1]
-        if latest_dy_norm > 0.0:
+        # last step must not be downward
+        if dy_norm[-1] > 0:
             return False
 
         return True
 
 
 class Tracker:
-    def __init__(self, frame_w: int, frame_h: int):
+    def __init__(self, w, h):
         self.tracks: Dict[int, Track] = {}
         self.next_id = 1
-        self.frame_w = frame_w
-        self.frame_h = frame_h
+        self.frame_w = w
+        self.frame_h = h
+        self.area = w*h
+        self.diag = float(math.hypot(w,h))
+        self.min_side = float(min(w,h))
 
-        self.frame_area = float(frame_w * frame_h)
-        self.frame_diag = float(math.hypot(frame_w, frame_h))
-        self.min_side = float(min(frame_w, frame_h))
+    def _dist(self, p1, p2):
+        return math.hypot(p1[0]-p2[0], p1[1]-p2[1])
 
-    def _distance(self, p1, p2) -> float:
-        (x1, y1), (x2, y2) = p1, p2
-        return math.hypot(x1 - x2, y1 - y2)
+    def update(self, detections, frame_idx):
+        """detections = [(cx,cy,bbox), ...]"""
+        unmatched_det = set(range(len(detections)))
+        unmatched_trk = set(self.tracks.keys())
 
-    def update(
-        self,
-        detections: List[Tuple[float, float, Tuple[int, int, int, int]]],
-        frame_index: int,
-    ):
-        """
-        detections: list of (cx, cy, bbox)
-        """
-        # Associate detections to existing tracks using greedy nearest neighbor
-        unmatched_detections = set(range(len(detections)))
-        unmatched_tracks = set(self.tracks.keys())
+        maxd = MAX_ASSOC_DIST_RATIO * self.diag
+        pairs = []
 
-        max_dist = MAX_ASSOC_DIST_RATIO * self.frame_diag
-
-        # Precompute distances
-        distances: List[Tuple[float, int, int]] = []  # (dist, track_id, det_idx)
-        for track_id in self.tracks:
-            track = self.tracks[track_id]
-            tx, ty = track.positions[-1] if track.positions else (None, None)
-            if tx is None:
+        for tid,tr in self.tracks.items():
+            if not tr.positions:
                 continue
-            for det_idx, (cx, cy, _) in enumerate(detections):
-                d = self._distance((tx, ty), (cx, cy))
-                if d <= max_dist:
-                    distances.append((d, track_id, det_idx))
+            tx,ty = tr.positions[-1]
+            for i,(cx,cy,_) in enumerate(detections):
+                d = self._dist((tx,ty),(cx,cy))
+                if d <= maxd:
+                    pairs.append((d, tid, i))
 
-        # Sort by distance so we assign closest matches first
-        distances.sort(key=lambda x: x[0])
+        pairs.sort(key=lambda x:x[0])
 
-        for d, track_id, det_idx in distances:
-            if (track_id not in unmatched_tracks) or (det_idx not in unmatched_detections):
+        # assign pairs
+        for d,tid,i in pairs:
+            if tid not in unmatched_trk:
                 continue
-            # Assign
-            unmatched_tracks.remove(track_id)
-            unmatched_detections.remove(det_idx)
+            if i not in unmatched_det:
+                continue
+            unmatched_trk.remove(tid)
+            unmatched_det.remove(i)
 
-            cx, cy, bbox = detections[det_idx]
-            self.tracks[track_id].add_detection(cx, cy, bbox, frame_index)
+            cx,cy,bbox = detections[i]
+            self.tracks[tid].add_detection(cx,cy,bbox,frame_idx)
 
-        # Create new tracks for remaining detections
-        for det_idx in unmatched_detections:
-            cx, cy, bbox = detections[det_idx]
-            track = Track(track_id=self.next_id)
-            track.add_detection(cx, cy, bbox, frame_index)
-            self.tracks[self.next_id] = track
+        # create new tracks
+        for i in unmatched_det:
+            cx,cy,bbox = detections[i]
+            tr = Track(self.next_id)
+            tr.add_detection(cx,cy,bbox,frame_idx)
+            self.tracks[self.next_id] = tr
             self.next_id += 1
 
-        # Remove stale tracks
-        to_delete = [
-            track_id
-            for track_id, tr in self.tracks.items()
-            if frame_index - tr.last_seen_frame > MAX_MISSED_FRAMES
-        ]
-        for track_id in to_delete:
-            del self.tracks[track_id]
+        # prune stale
+        kill = [tid for tid,tr in self.tracks.items()
+                if frame_idx - tr.last_seen_frame > MAX_MISSED_FRAMES]
+        for tid in kill:
+            del self.tracks[tid]
 
-    def get_upward_fruit_tracks(self) -> List[Track]:
-        return [
-            tr
-            for tr in self.tracks.values()
-            if tr.is_upward_fruit(self.frame_w, self.frame_h)
-        ]
+    def get_upward_fruit_tracks(self):
+        return [tr for tr in self.tracks.values()
+                if tr.is_upward_fruit(self.frame_w, self.frame_h)]
 
 
-# ---------------------
-# REGION CONFIGURATION
-# ---------------------
+# -------------------------
+# MOUSE SWIPE
+# -------------------------
 
-def select_play_area() -> Dict[str, int]:
-    """Interactively select the Fruit Ninja play area with the mouse + SPACE."""
-    points: List[Tuple[int, int]] = []
-    mouse_controller = mouse.Controller()
-
-    print("\n=== Configure Play Area ===")
-    print("Hover over the FIRST corner and press SPACE.")
-    print("Then hover over the OPPOSITE corner and press SPACE again.")
-    print("Press ESC at any time to cancel.\n")
-
-    def on_press(key):
-        nonlocal points
-
-        if key == CANCEL_KEY:
-            print("Selection cancelled (ESC pressed).")
-            return False
-
-        if key == CONFIRM_KEY:
-            x, y = mouse_controller.position
-            points.append((x, y))
-            print(f"Captured point {len(points)} at ({x}, {y})")
-
-            if len(points) == 2:
-                (x1, y1), (x2, y2) = points
-                left = int(min(x1, x2))
-                top = int(min(y1, y2))
-                right = int(max(x1, x2))
-                bottom = int(max(y1, y2))
-
-                width = right - left
-                height = bottom - top
-
-                print("\n=== Play Area Bounding Box ===")
-                print(f"Top-left:     ({left}, {top})")
-                print(f"Bottom-right: ({right}, {bottom})")
-                print(f"Width:  {width}")
-                print(f"Height: {height}")
-                print("================================\n")
-
-                return False  # stop listener
-
-    with keyboard.Listener(on_press=on_press) as listener:
-        listener.join()
-
-    if len(points) != 2:
-        return {}
-
-    (x1, y1), (x2, y2) = points
-    left = int(min(x1, x2))
-    top = int(min(y1, y2))
-    right = int(max(x1, x2))
-    bottom = int(max(y1, y2))
-
-    region = {
-        "left": left,
-        "top": top,
-        "width": right - left,
-        "height": bottom - top,
-    }
-
-    return region
-
-
-# --------------
-# GLOBAL ESC HANDLER
-# --------------
-
-def on_global_key_press(key):
-    """Global ESC handler: sets exit_requested so loops can stop."""
-    global exit_requested
-    if key == keyboard.Key.esc:
-        exit_requested = True
-        print("ESC pressed: exit requested.")
-        # Returning False stops this listener; that's fine because we only need one press
-        return False
-
-
-# --------------
-# MULTI-FRUIT SWIPE
-# --------------
-
-def perform_multi_swipe(
-    mouse_controller: mouse.Controller,
-    points: List[Tuple[float, float]],
-    swipe_length: int,
-    duration_ms: int = SWIPE_DURATION_MS,
-    steps_per_segment: int = SWIPE_STEPS_PER_SEG,
-):
+def perform_multi_swipe(mouse_ctl, points, swipe_length, duration_ms, steps_per_seg):
     """
-    Perform one continuous mouse drag that passes near all given points,
-    biased to move from top to bottom overall.
-
-    - points: list of (screen_x, screen_y) targets (already in screen coords)
-    - swipe_length: used to extend the swipe above/below fruits
-    - duration_ms: total swipe duration for the entire path
-    - steps_per_segment: how many small moves per segment between points
+    Vertical top→bottom swipe through all points.
     """
     if not points:
         return
 
-    # Sort by Y so we go roughly top -> bottom
-    points = sorted(points, key=lambda p: p[1])
+    # Sort by Y (top to bottom)
+    points = sorted(points, key=lambda p:p[1])
 
     first_x, first_y = points[0]
-    last_x, last_y = points[-1]
+    last_x,  last_y  = points[-1]
 
     L = float(swipe_length)
 
-    # Start a bit ABOVE the highest fruit and end a bit BELOW the lowest
-    start = (first_x, first_y - L / 2.0)
-    end = (last_x,  last_y + L / 2.0)
+    start = (first_x, first_y - L/2)
+    end   = (last_x,  last_y + L/2)
 
     path = [start] + points + [end]
 
     if len(path) < 2:
         return
 
-    total_segments = len(path) - 1
-    if total_segments <= 0:
-        return
+    if steps_per_seg <= 0:
+        steps_per_seg = 1
 
-    if steps_per_segment <= 0:
-        steps_per_segment = 1
+    total_steps = max(1, (len(path)-1)*steps_per_seg)
+    dt = (duration_ms/1000.0)/float(total_steps)
 
-    total_steps = max(1, total_segments * steps_per_segment)
-    dt = (duration_ms / 1000.0) / float(total_steps)
-
-    # Start at first point
-    x0, y0 = path[0]
-    mouse_controller.position = (int(x0), int(y0))
+    x0,y0 = path[0]
+    mouse_ctl.position = (int(x0),int(y0))
     time.sleep(0.003)
-    mouse_controller.press(mouse.Button.left)
+    mouse_ctl.press(mouse.Button.left)
     time.sleep(0.003)
 
-    # Walk along each segment in small steps (generally downward)
-    for (sx, sy), (ex, ey) in zip(path[:-1], path[1:]):
-        sx, sy, ex, ey = float(sx), float(sy), float(ex), float(ey)
-        dx = (ex - sx) / float(steps_per_segment)
-        dy = (ey - sy) / float(steps_per_segment)
+    # interpolate each segment
+    for (sx,sy),(ex,ey) in zip(path[:-1], path[1:]):
+        sx,sy,ex,ey = map(float,(sx,sy,ex,ey))
+        dx = (ex-sx)/steps_per_seg
+        dy = (ey-sy)/steps_per_seg
 
-        x, y = sx, sy
-        for _ in range(steps_per_segment):
+        x,y = sx,sy
+        for _ in range(steps_per_seg):
             x += dx
             y += dy
-            mouse_controller.position = (int(x), int(y))
+            mouse_ctl.position = (int(x),int(y))
             time.sleep(dt)
 
-    mouse_controller.release(mouse.Button.left)
+    mouse_ctl.release(mouse.Button.left)
     time.sleep(0.003)
 
-# --------------
+
+# -------------------------
+# GLOBAL ESC HANDLER
+# -------------------------
+
+def on_global_key_press(key):
+    global exit_requested
+    if key == keyboard.Key.esc:
+        exit_requested = True
+        return False
+
+
+# -------------------------
+# REGION SELECTION
+# -------------------------
+
+def select_play_area():
+    pts = []
+    mouse_ctl = mouse.Controller()
+
+    print("\n=== Configure Play Area ===")
+    print("Hover over FIRST corner and press SPACE.")
+    print("Hover over OPPOSITE corner and press SPACE again.")
+    print("Press ESC to cancel.\n")
+
+    def handler(k):
+        nonlocal pts
+        if k == CANCEL_KEY:
+            print("Cancelled.")
+            return False
+        if k == CONFIRM_KEY:
+            x,y = mouse_ctl.position
+            pts.append((x,y))
+            print(f"Captured point {len(pts)}: {x},{y}")
+            if len(pts)==2:
+                return False
+
+    with keyboard.Listener(on_press=handler) as ls:
+        ls.join()
+
+    if len(pts)!=2:
+        return {}
+
+    (x1,y1),(x2,y2) = pts
+    left   = min(x1,x2)
+    top    = min(y1,y2)
+    right  = max(x1,x2)
+    bottom = max(y1,y2)
+
+    return {
+        "left": left,
+        "top": top,
+        "width": right-left,
+        "height": bottom-top
+    }
+
+
+# -------------------------
 # MAIN LOOP
-# --------------
+# -------------------------
 
-def run_mirror_window(region: Dict[str, int]) -> None:
-    """Mirror the selected region, track blobs, highlight upward-moving fruits,
-    and perform multi-fruit swipes near the tops of their bounding boxes."""
-
-    last_swipe_frame = -9999
+def run_mirror_window(region):
 
     if not region:
-        print("No valid region provided; aborting mirror window.")
+        print("No region.")
         return
 
     w = region["width"]
     h = region["height"]
 
-    print("Region:", region)
-    print("Starting mirror window. Press ESC at any time to quit.\n")
-
-    tracker = Tracker(w, h)
+    tracker = Tracker(w,h)
 
     prev_gray = None
-    frame_index = 0
+    frame_idx = 0
 
+    mouse_ctl = mouse.Controller()
     kernel = np.ones((KERNEL_SIZE, KERNEL_SIZE), np.uint8)
-    frame_area = float(w * h)
-    min_side = float(min(w, h))
+    frame_area = float(w*h)
+    min_side = float(min(w,h))
     swipe_length = max(5, int(SWIPE_LENGTH_RATIO * min_side))
 
-    mouse_controller = mouse.Controller()
+    last_swipe_frame = -9999  # cooldown tracker
 
     with mss.mss() as sct:
         while True:
             global exit_requested
             if exit_requested:
-                print("Exit requested, stopping main loop.")
                 break
 
             screenshot = sct.grab(region)
-
             frame = np.array(screenshot)
             frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            gray = cv2.GaussianBlur(gray, (5, 5), 0)
+            # -------------------------
+            # BOMB DETECTION
+            # -------------------------
+            # Pure red: R = 255→~156, G=B=0
+            lower_bomb = np.array([0,0,156], dtype=np.uint8)
+            upper_bomb = np.array([20,20,255], dtype=np.uint8)
 
-            detections: List[Tuple[float, float, Tuple[int, int, int, int]]] = []
+            bomb_mask = cv2.inRange(frame, lower_bomb, upper_bomb)
+            bomb_mask = cv2.morphologyEx(bomb_mask, cv2.MORPH_OPEN, np.ones((3,3),np.uint8))
+            bomb_mask = cv2.morphologyEx(bomb_mask, cv2.MORPH_CLOSE, np.ones((3,3),np.uint8))
+
+            bomb_ctrs,_ = cv2.findContours(bomb_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            bomb_boxes = []
+            TOP_IGNORE_Y = int(0.10 * h)   # IGNORE top 10% of play area
+
+            for c in bomb_ctrs:
+                if cv2.contourArea(c) < 80:
+                    continue
+
+                bx,by,bw,bh = cv2.boundingRect(c)
+
+                # ----------------------------
+                # IGNORE BOMBS IN TOP 10% (these are icons, not real bombs)
+                # ----------------------------
+                if by < TOP_IGNORE_Y:
+                    continue
+
+                bomb_boxes.append((bx,by,bw,bh))
+
+                # (Optional visualization — remove if you like)
+                cv2.rectangle(frame,(bx,by),(bx+bw,by+bh),(255,0,0),2)
+                cv2.putText(frame,"BOMB",(bx,by-5),
+                            cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,0,0),1)
+
+
+            # -------------------------
+            # MOTION DETECTION
+            # -------------------------
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray,(5,5),0)
+
+            detections = []
 
             if prev_gray is not None:
-                # --- Frame differencing for motion mask ---
                 diff = cv2.absdiff(gray, prev_gray)
-                _, motion_mask = cv2.threshold(diff, FRAME_DIFF_THRESH, 255, cv2.THRESH_BINARY)
+                _,mask = cv2.threshold(diff, FRAME_DIFF_THRESH, 255, cv2.THRESH_BINARY)
+                mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-                # Clean up noise
-                motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_OPEN, kernel)
-                motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_CLOSE, kernel)
+                cnts,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-                # Find moving blobs
-                contours, _ = cv2.findContours(
-                    motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-                )
-
-                for cnt in contours:
-                    area = cv2.contourArea(cnt)
+                for c in cnts:
+                    area = cv2.contourArea(c)
                     if area < MIN_AREA_RATIO * frame_area:
                         continue
-
-                    x, y, bw, bh = cv2.boundingRect(cnt)
+                    x,y,bw,bh = cv2.boundingRect(c)
                     if bw < MIN_BOX_RATIO * min_side or bh < MIN_BOX_RATIO * min_side:
                         continue
 
-                    cx = x + bw / 2.0
-                    cy = y + bh / 2.0
+                    cx = x + bw/2
+                    cy = y + bh/2
+                    detections.append((cx,cy,(x,y,bw,bh)))
 
-                    detections.append((cx, cy, (x, y, bw, bh)))
+                    # green box
+                    cv2.rectangle(frame,(x,y),(x+bw,y+bh),(0,255,0),1)
 
-                    # GREEN: raw moving blobs for debugging
-                    cv2.rectangle(frame, (x, y), (x + bw, y + bh), (0, 255, 0), 1)
+            # -------------------------
+            # TRACKING + FRUIT CLASSIFICATION
+            # -------------------------
+            tracker.update(detections, frame_idx)
+            red_tracks = tracker.get_upward_fruit_tracks()
 
-            # Update tracker with detections
-            tracker.update(detections, frame_index)
+            # -------------------------
+            # COLLECT SAFE FRUIT TARGETS (bomb exclusion)
+            # -------------------------
+            safe_points = []
 
-            # Highlight tracks classified as upward-moving fruits
-            upward_tracks = tracker.get_upward_fruit_tracks()
+            for tr in red_tracks:
+                x,y,bw,bh = tr.bbox
+                cx,cy = tr.positions[-1]
 
-            # Collect all current fruit targets (screen coords) for this frame
-            current_points: List[Tuple[float, float]] = []
+                # draw red box
+                cv2.rectangle(frame, (x,y), (x+bw,y+bh), (0,0,255),2)
+                cv2.circle(frame, (int(cx),int(cy)), 4, (0,0,255), -1)
 
-            for tr in upward_tracks:
-                x, y, bw, bh = tr.bbox
-                cx, cy = tr.positions[-1]
+                # compute slice point near top of bbox
+                sy_local = y + int(0.2*bh)
+                slice_cx = region["left"] + (x + bw/2.0)
+                slice_cy = region["top"]  + sy_local
 
-                # RED: fruit candidates (drawing stays the same)
-                cv2.rectangle(frame, (x, y), (x + bw, y + bh), (0, 0, 255), 2)
-                cv2.circle(frame, (int(cx), int(cy)), 4, (0, 0, 255), -1)
+                # BOMB AVOIDANCE: skip if point lies inside any bomb bounding box
+                in_bomb = False
+                for (bx,by,bw2,bh2) in bomb_boxes:
+                    if bx <= (x+bw/2) <= (bx+bw2) and by <= sy_local <= (by+bh2):
+                        in_bomb = True
+                        break
 
-                label = f"ID {tr.track_id}"
-                cv2.putText(
-                    frame,
-                    label,
-                    (x, y - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (0, 0, 255),
-                    1,
-                    cv2.LINE_AA,
-                )
+                if not in_bomb:
+                    safe_points.append((slice_cx, slice_cy))
 
-                # Aim near top of the box (you can keep 0.2 or tweak)
-                top_y_local = y + int(0.2 * bh)
-                slice_cx = x + bw / 2.0
-                slice_cy = top_y_local
-
-                screen_x = region["left"] + slice_cx
-                screen_y = region["top"] + slice_cy
-
-                current_points.append((screen_x, screen_y))
-
-            # If we have any fruit this frame and cooldown passed, slice them all
-            if current_points and (frame_index - last_swipe_frame) >= SWIPE_COOLDOWN_FRAMES:
-                # Sort by something (X for left-right, Y for top-bottom) depending on your swipe style
-                # For vertical swipe version, sort by Y:
-                current_points.sort(key=lambda p: p[1])
-
+            # -------------------------
+            # SWIPE (VERTICAL) IF SAFE FRUITS EXIST
+            # -------------------------
+            if safe_points and (frame_idx - last_swipe_frame >= SWIPE_COOLDOWN_FRAMES):
                 perform_multi_swipe(
-                    mouse_controller,
-                    current_points,
+                    mouse_ctl,
+                    safe_points,
                     swipe_length,
                     SWIPE_DURATION_MS,
-                    SWIPE_STEPS_PER_SEG,
+                    SWIPE_STEPS_PER_SEG
                 )
-                last_swipe_frame = frame_index
+                last_swipe_frame = frame_idx
 
+            # -------------------------
+            # DEBUG TEXT
+            # -------------------------
+            dbg = f"{w}x{h}  Tracks:{len(tracker.tracks)}  Bombs:{len(bomb_boxes)}"
+            cv2.putText(frame, dbg, (10,30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255),2)
 
-            # Debug overlay
-            debug_text = f"{w}x{h} | tracks={len(tracker.tracks)}"
-            cv2.putText(
-                frame,
-                debug_text,
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
+            cv2.imshow("NinjaBot View", frame)
 
-            cv2.imshow("Fruit Ninja Tracker View", frame)
-
-            frame_index += 1
             prev_gray = gray
+            frame_idx += 1
 
-            # 'q' is extra exit; ESC is global
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
     cv2.destroyAllWindows()
 
 
-def main() -> None:
+# -------------------------
+# MAIN
+# -------------------------
+
+def main():
     global exit_requested
     region = select_play_area()
-
     if not region:
-        print("No region selected. Exiting.")
+        print("No region selected.")
         return
 
-    # Reset exit flag
     exit_requested = False
-
-    # Start global ESC listener (non-blocking)
     esc_listener = keyboard.Listener(on_press=on_global_key_press)
     esc_listener.start()
 
