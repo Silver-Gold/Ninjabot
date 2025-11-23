@@ -35,7 +35,7 @@ CONFIRM_KEY = keyboard.Key.space
 CANCEL_KEY = keyboard.Key.esc
 
 # ---- Motion / blob detection ----
-FRAME_DIFF_THRESH = 18        # grayscale diff threshold for motion mask
+FRAME_DIFF_THRESH = 15        # grayscale diff threshold for motion mask
 KERNEL_SIZE = 5               # morphology kernel size
 
 # ---- Scale-invariant blob filters ----
@@ -60,8 +60,8 @@ BOTTOM_REGION_MAX_RATIO = 0.95   # and centroid_y < this * frame_height
 
 # ---- Swipe behavior ----
 SWIPE_LENGTH_RATIO = 0.25       # base slash length as fraction of min(frame_w, frame_h)
-SWIPE_DURATION_MS = 40          # total duration of a full multi-fruit swipe (tweak this)
-SWIPE_STEPS_PER_SEG = 4         # interpolation steps per segment between fruits
+SWIPE_DURATION_MS = 44          # total duration of a full multi-fruit swipe (tweak this)
+SWIPE_STEPS_PER_SEG = 20         # interpolation steps per segment between fruits
 
 SWIPE_COOLDOWN_FRAMES = 2   # minimum frames between swipes (tune this)
 
@@ -198,7 +198,7 @@ class Tracker:
 # MOUSE SWIPE
 # -------------------------
 
-def perform_multi_swipe(mouse_ctl, points, swipe_length, duration_ms, steps_per_seg):
+def perform_multi_swipe(mouse_ctl, points, swipe_length, duration_ms, steps_per_seg, bomb_boxes, region):
     """
     Vertical top→bottom swipe through all points.
     """
@@ -243,6 +243,25 @@ def perform_multi_swipe(mouse_ctl, points, swipe_length, duration_ms, steps_per_
         for _ in range(steps_per_seg):
             x += dx
             y += dy
+
+            global exit_requested
+            if exit_requested:
+                mouse_ctl.release(mouse.Button.left)
+                return
+
+            rel_x = x - region["left"]
+            rel_y = y - region["top"]
+
+            for (bx,by,bw,bh) in bomb_boxes:
+                # Make avoidance box 75% larger than bomb
+                ebx = bx - int(bw * 0.375)
+                eby = by - int(bh * 0.375)
+                ebw = bw + int(bw * 0.75)
+                ebh = bh + int(bh * 0.75)
+                if ebx <= rel_x <= ebx + ebw and eby <= rel_y <= eby + ebh:
+                    mouse_ctl.release(mouse.Button.left)
+                    return # Stop the swipe
+
             mouse_ctl.position = (int(x),int(y))
             time.sleep(dt)
 
@@ -351,7 +370,9 @@ def run_mirror_window(region):
 
             bomb_mask = cv2.inRange(frame, lower_bomb, upper_bomb)
             bomb_mask = cv2.morphologyEx(bomb_mask, cv2.MORPH_OPEN, np.ones((3,3),np.uint8))
-            bomb_mask = cv2.morphologyEx(bomb_mask, cv2.MORPH_CLOSE, np.ones((3,3),np.uint8))
+            # Use a larger kernel for closing to merge fragmented bomb parts
+            bomb_close_kernel = np.ones((9,9),np.uint8)
+            bomb_mask = cv2.morphologyEx(bomb_mask, cv2.MORPH_CLOSE, bomb_close_kernel)
 
             bomb_ctrs,_ = cv2.findContours(bomb_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -376,6 +397,13 @@ def run_mirror_window(region):
                 cv2.rectangle(frame,(bx,by),(bx+bw,by+bh),(255,0,0),2)
                 cv2.putText(frame,"BOMB",(bx,by-5),
                             cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,0,0),1)
+
+                # Draw avoidance box (75% larger)
+                ebx = bx - int(bw * 0.625)
+                eby = by - int(bh * 0.625)
+                ebw = bw + int(bw * 1.0)
+                ebh = bh + int(bh * 1.0)
+                cv2.rectangle(frame, (ebx, eby), (ebx + ebw, eby + ebh), (0, 0, 0), 2)
 
 
             # -------------------------
@@ -436,7 +464,12 @@ def run_mirror_window(region):
                 # BOMB AVOIDANCE: skip if point lies inside any bomb bounding box
                 in_bomb = False
                 for (bx,by,bw2,bh2) in bomb_boxes:
-                    if bx <= (x+bw/2) <= (bx+bw2) and by <= sy_local <= (by+bh2):
+                    # Make avoidance box 75% larger than bomb
+                    ebx = bx - int(bw2 * 0.625)
+                    eby = by - int(bh2 * 0.625)
+                    ebw = bw2 + int(bw2 * 1.0)
+                    ebh = bh2 + int(bh2 * 1.0)
+                    if ebx <= (x+bw/2) <= (ebx+ebw) and eby <= sy_local <= (eby+ebh):
                         in_bomb = True
                         break
 
@@ -452,7 +485,9 @@ def run_mirror_window(region):
                     safe_points,
                     swipe_length,
                     SWIPE_DURATION_MS,
-                    SWIPE_STEPS_PER_SEG
+                    SWIPE_STEPS_PER_SEG,
+                    bomb_boxes,
+                    region,
                 )
                 last_swipe_frame = frame_idx
 
